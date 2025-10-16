@@ -30,7 +30,6 @@ def health():
     return {"ok": True}
 
 @flask_app.post("/translate")
-
 def translate():
     data = request.get_json(force=True) or {}
     text = (data.get("text") or "").strip()
@@ -66,39 +65,7 @@ def translate():
             detail = str(e)
         return jsonify({"error": "translate_failed", "detail": detail}), status
 
-    data = request.get_json(force=True) or {}
-    text = (data.get("text") or "").strip()
-    to = (data.get("to") or "").strip()
-    from_lang = (data.get("from") or "").strip() or None
 
-    if not text or not to:
-        return jsonify({"error": "missing_text_or_to"}), 400
-
-    params = {"api-version": "3.0", "to": to}
-    if from_lang:
-        params["from"] = from_lang
-
-    headers = {
-        "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
-        "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,
-        "Content-Type": "application/json",
-    }
-    body = [{"Text": text}]
-
-    try:
-        r = requests.post(f"{API_BASE}/translate", params=params, headers=headers, json=body, timeout=10)
-        r.raise_for_status()
-        payload = r.json()
-        translated = payload[0]["translations"][0]["text"]
-        return jsonify({"translated": translated})
-    except requests.RequestException as e:
-        status = getattr(getattr(e, "response", None), "status_code", 500)
-        detail = None
-        try:
-            detail = e.response.json()
-        except Exception:
-            detail = str(e)
-        return jsonify({"error": "translate_failed", "detail": detail}), status
 
 @flask_app.get("/speech/token")
 def speech_token():
