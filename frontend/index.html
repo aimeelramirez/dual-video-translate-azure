@@ -1,0 +1,165 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Dual Stream — Azure Speech + Translator</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 16px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .panel { border: 1px solid #ddd; border-radius: 12px; padding: 12px; }
+    video { width: 100%; border-radius: 8px; background: #000; }
+    .captions { font-size: 14px; margin-top: 8px; white-space: pre-wrap; min-height: 64px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+    input, select, button { padding: 8px; }
+    h2 { margin-top: 0; }
+  </style>
+</head>
+<body>
+  <h2>Two-Way Video with Live STT + Translation</h2>
+  <div class="row">
+    <input id="backend" size="48" placeholder="https://your-backend.onrender.com" />
+    <input id="room" placeholder="room-1234" />
+    <select id="fromLang">
+      <option value="">Auto (Speech SDK auto-detect disabled here; using explicit locale)</option>
+      <option value="en-US" selected>en-US</option>
+      <option value="es-ES">es-ES</option>
+      <option value="fr-FR">fr-FR</option>
+      <option value="ar-EG">ar-EG</option>
+      <option value="ru-RU">ru-RU</option>
+    </select>
+    <select id="toLang">
+      <option value="fr" selected>fr</option>
+      <option value="es">es</option>
+      <option value="ar">ar</option>
+      <option value="ru">ru</option>
+      <option value="en">en</option>
+    </select>
+    <button id="join">Join</button>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h3>Me</h3>
+      <video id="localVideo" autoplay playsinline muted></video>
+      <div id="localCaption" class="captions"></div>
+    </div>
+    <div class="panel">
+      <h3>Peer</h3>
+      <video id="remoteVideo" autoplay playsinline></video>
+      <div id="remoteCaption" class="captions"></div>
+    </div>
+  </div>
+
+  <!-- Azure Speech SDK -->
+  <script src="https://aka.ms/csspeech/jsbrowserpackageraw"></script>
+  <!-- Socket.IO -->
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" integrity="sha384-qy7wE0A6WwzsY2dQXyYg3j0dTcnUq5d0RpH0g0HcHn3YwBG7u8m3Zq8wq5O7QJkO" crossorigin="anonymous"></script>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let pc, socket, localStream, recognizer;
+
+    function appendCaption(targetId, line) {
+      const el = $(targetId);
+      const prev = (el.textContent || "").trim();
+      const next = (prev + "\\n" + line).trim().split("\\n").slice(-6).join("\\n");
+      el.textContent = next;
+    }
+
+    async function getSpeechToken(base) {
+      const r = await fetch(base + "/speech/token");
+      if (!r.ok) throw new Error("Failed to get speech token");
+      return r.json(); // { region, token }
+    }
+
+    async function translate(base, text, to, from) {
+      const r = await fetch(base + "/translate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, to, from })
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "translate_failed");
+      return j.translated;
+    }
+
+    async function initSTT(base) {
+      const { region, token } = await getSpeechToken(base);
+      const sdk = window.SpeechSDK;
+      const speechConfig = sdk.SpeechConfig.fromAuthorizationToken(token, region);
+      speechConfig.speechRecognitionLanguage = $("fromLang").value || "en-US";
+      const audioConfig = sdk.AudioConfig.fromDefaultMicrophoneInput();
+      recognizer = new sdk.SpeechRecognizer(speechConfig, audioConfig);
+
+      recognizer.recognized = async (s, e) => {
+        if (e.result.reason === sdk.ResultReason.RecognizedSpeech) {
+          const raw = e.result.text;
+          appendCaption("localCaption", raw);
+          try {
+            const translated = await translate(base, raw, $("toLang").value, "");
+            // Send translated caption to peer
+            const room = $("room").value.trim() || "room-1234";
+            socket.emit("signal", { room, type: "caption", payload: { text: translated } });
+          } catch (err) {
+            console.error("translate error", err);
+          }
+        }
+      };
+
+      recognizer.canceled = (s, e) => console.warn("Speech canceled", e);
+      recognizer.sessionStopped = (s, e) => console.warn("Speech session stopped", e);
+      recognizer.startContinuousRecognitionAsync();
+    }
+
+    async function startMedia() {
+      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      $("localVideo").srcObject = localStream;
+    }
+
+    function initSignaling(base, room) {
+      socket = io(base, { transports: ["websocket"], withCredentials: false });
+      socket.on("connect", () => socket.emit("join", { room }));
+      socket.on("signal", async (msg) => {
+        if (msg.type === "sdp") {
+          const desc = new RTCSessionDescription(msg.payload);
+          await pc.setRemoteDescription(desc);
+          if (desc.type === "offer") {
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            socket.emit("signal", { room, type: "sdp", payload: pc.localDescription });
+          }
+        } else if (msg.type === "ice") {
+          try { await pc.addIceCandidate(msg.payload); } catch {}
+        } else if (msg.type === "caption") {
+          appendCaption("remoteCaption", msg.payload.text);
+        }
+      });
+    }
+
+    async function initWebRTC(room) {
+      pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+      pc.ontrack = (e) => { $("remoteVideo").srcObject = e.streams[0]; };
+      pc.onicecandidate = ({ candidate }) => {
+        if (candidate) socket.emit("signal", { room, type: "ice", payload: candidate });
+      };
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socket.emit("signal", { room, type: "sdp", payload: pc.localDescription });
+    }
+
+    $("join").onclick = async () => {
+      const base = $("backend").value.trim();
+      if (!base) return alert("Enter backend URL");
+      const room = $("room").value.trim() || "room-1234";
+
+      await startMedia();
+      initSignaling(base, room);
+      await initWebRTC(room);
+      await initSTT(base);
+    };
+  </script>
+</body>
+</html>
