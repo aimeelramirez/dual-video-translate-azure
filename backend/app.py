@@ -99,18 +99,24 @@ def speech_token():
 # ------------------
 sio = socketio.AsyncServer(
     async_mode="asgi",
-    cors_allowed_origins=CORS_ALLOW_ORIGIN,
+    cors_allowed_origins=CORS_ALLOW_ORIGIN if CORS_ALLOW_ORIGIN else "*",
+    ping_timeout=25,
+    ping_interval=20,
 )
 
 presence_lock = asyncio.Lock()
-# room -> userId -> {"name": str, "devices": set(deviceId, ...)} 
+# room -> userId -> {"name": str, "devices": set(deviceId, ...)}
 room_users = defaultdict(dict)
 
 async def emit_roster(room: str):
     async with presence_lock:
         users = room_users.get(room, {})
         roster = [
-            {"userId": uid, "name": info.get("name") or uid, "devices": sorted(list(info.get("devices", set())))}
+            {
+                "userId": uid,
+                "name": info.get("name") or uid,
+                "devices": sorted(list(info.get("devices", set())))
+            }
             for uid, info in users.items()
         ]
     await sio.emit("roster", {"room": room, "users": roster}, room=room)
@@ -140,8 +146,9 @@ async def on_join(sid, data):
     device_id = (data.get("deviceId") or "").strip()
     name = (data.get("name") or user_id or "Guest").strip()
 
+    # Allow anonymous listener to join the room (no identity tracked)
     if not user_id or not device_id:
-        sio.enter_room(sid, room)
+        await sio.enter_room(sid, room)
         await sio.emit("system", {"message": "joined"}, room=room, skip_sid=sid)
         return
 
@@ -150,13 +157,13 @@ async def on_join(sid, data):
         if _name_taken_locked(room, name, user_id):
             await sio.emit("system", {"level": "error", "message": "name_taken", "name": name}, to=sid)
             return
-        # Optional capacity guard: 2 distinct users
+        # Optional capacity guard example:
         # distinct = len(room_users.get(room, {}))
         # if distinct >= 2 and user_id not in room_users[room]:
         #     await sio.emit("system", {"level": "error", "message": "room_full"}, to=sid)
         #     return
 
-    sio.enter_room(sid, room)
+    await sio.enter_room(sid, room)
     await sio.save_session(sid, {"room": room, "userId": user_id, "deviceId": device_id, "name": name})
 
     async with presence_lock:
@@ -199,7 +206,6 @@ async def on_set_name(sid, data):
         if ue:
             ue["name"] = new_name
 
-    # update session + broadcast roster
     await sio.save_session(sid, {**session, "name": new_name})
     await emit_roster(room)
 
@@ -250,6 +256,7 @@ asgi_flask = WsgiToAsgi(flask_app)
 asgi_app = socketio.ASGIApp(sio, other_asgi_app=asgi_flask)
 
 if __name__ == "__main__":
+    # Run the in-memory ASGI app directly (works locally and in Docker)
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("app:asgi_app", host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run(asgi_app, host="0.0.0.0", port=port, log_level="info")
