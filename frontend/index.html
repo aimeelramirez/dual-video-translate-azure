@@ -22,18 +22,19 @@
 </head>
 <body>
   <h2>Two-Way Video with Live STT + Translation</h2>
-
   <div id="presence" style="margin:.5rem 0; font:14px system-ui;"></div>
+  <h3 id="roomHeader">Current players in room —</h3>
   <ul id="roster" style="margin:.25rem 0; padding-left:1rem;"></ul>
 
   <div class="row">
     <input id="backend" size="48"
            placeholder="https://dual-video-translate-azure.onrender.com"
-           value="https://dual-video-translate-azure.onrender.com"/>
-    <input id="room" placeholder="room-1234" />
+           value="http://localhost:8000"/>
+    <input id="room" placeholder="room-1234" style="width:140px" />
+    <input id="username" placeholder="Enter your name" style="width:160px" />
 
-    <select id="fromLang">
-      <option value="">Auto (explicit locale recommended)</option>
+    <select id="fromLang" title="Speech recognition locale">
+      <option value="">Auto</option>
       <option value="en-US" selected>en-US</option>
       <option value="es-ES">es-ES</option>
       <option value="fr-FR">fr-FR</option>
@@ -41,26 +42,15 @@
       <option value="ru-RU">ru-RU</option>
     </select>
 
-    <select id="toLang">
-      <option value="fr">fr</option>
+    <select id="toLang" title="Translate my speech to">
+      <option value="en">en</option>
       <option value="es" selected>es</option>
+      <option value="fr">fr</option>
       <option value="ar">ar</option>
       <option value="ru">ru</option>
-      <option value="en">en</option>
     </select>
 
-    <button id="swap">Swap EN↔ES</button>
     <button id="join">Join</button>
-    <button id="newId" title="Use a new random user id in this tab">New Identity</button>
-  </div>
-
-  <div class="row" style="gap:16px;">
-    <label style="display:inline-flex;align-items:center;gap:.35rem;">
-      <input type="checkbox" id="speakPeer" checked> Speak peer captions
-    </label>
-    <label style="display:inline-flex;align-items:center;gap:.35rem;">
-      <input type="checkbox" id="speakMine"> Speak my captions
-    </label>
   </div>
 
   <div id="debug" style="font:12px system-ui;opacity:.8;margin-bottom:8px"></div>
@@ -80,7 +70,7 @@
 
   <script>
     const $ = (id) => document.getElementById(id);
-    let pc, socket, localStream, recognizer, ttsSynth;
+    let pc, socket, localStream, recognizer;
 
     // --- Presence helpers ---
     const presence = {
@@ -90,26 +80,45 @@
         list.innerHTML = "";
         users.forEach(u => {
           const li = document.createElement("li");
-          li.textContent = `${u.name || u.userId} (${u.devices.length} device${u.devices.length>1?"s":""})`;
+          const dcount = (u.devices || []).length || 0;
+          li.textContent = `${u.name || u.userId} (${dcount} device${dcount>1?"s":""})`;
           list.appendChild(li);
         });
       }
     };
 
-    // Allow overriding identity via URL: ?uid=alice & ?room=demo
+    // ---------- Identity Setup ----------
     const QS = new URLSearchParams(location.search);
-    const QS_UID  = (QS.get("uid")  || "").trim();
+    const QS_UID = (QS.get("uid") || "").trim();
     const QS_ROOM = (QS.get("room") || "").trim();
 
-    // Stable identity per browser; fresh device per tab/session
-    const USER_ID   = QS_UID || localStorage.getItem("uid") || crypto.randomUUID();
+    // Prefill username input if saved
+    window.addEventListener("DOMContentLoaded", () => {
+      const saved = localStorage.getItem("displayName");
+      if (saved && $("username")) $("username").value = saved;
+    });
+
+    function resolveName() {
+      const typed = ($("username") && $("username").value.trim()) || "";
+      if (typed) {
+        localStorage.setItem("displayName", typed);
+        return typed;
+      }
+      let u = localStorage.getItem("displayName");
+      if (!u) {
+        u = "Guest-" + Math.floor(1000 + Math.random() * 9000);
+        localStorage.setItem("displayName", u);
+      }
+      return u;
+    }
+
+    const USER_ID = QS_UID || localStorage.getItem("uid") || crypto.randomUUID();
     if (QS_UID) localStorage.setItem("uid", USER_ID);
-    const NAME      = localStorage.getItem("displayName") || USER_ID || "Guest";
-    const DEVICE_ID = sessionStorage.getItem("deviceId")   || crypto.randomUUID();
+    const DEVICE_ID = sessionStorage.getItem("deviceId") || crypto.randomUUID();
     localStorage.setItem("uid", USER_ID);
     sessionStorage.setItem("deviceId", DEVICE_ID);
 
-    // Locale → short code (e.g., en-US → en)
+    // ---------- Helpers ----------
     function shortCode(locale) {
       if (!locale) return "";
       const dash = locale.indexOf("-");
@@ -123,16 +132,23 @@
       el.textContent = next;
     }
 
+    function updateRoomHeader(room, users=[]) {
+      const el = document.getElementById("roomHeader");
+      if (!el) return;
+      const names = users.map(u => u.name || u.userId).join(", ");
+      el.textContent = `Current players in ${room}: ${users.length}` + (users.length ? ` — ${names}` : "");
+    }
+
     async function getSpeechToken(base) {
       const r = await fetch(`${base}/speech/token`);
       if (!r.ok) throw new Error("speech token failed: " + r.status);
-      return r.json(); // { region, token }
+      return r.json();
     }
 
     async function translate(base, text) {
-      const toLang = $("toLang").value;
-      const fromLocale = $("fromLang").value;
-      const from = shortCode(fromLocale);
+      const toLang = ($("toLang") && $("toLang").value) || "en";
+      const fromLocale = ($("fromLang") && $("fromLang").value) || "";
+      const from = fromLocale ? shortCode(fromLocale) : "";
       const r = await fetch(`${base}/translate?to=${encodeURIComponent(toLang)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -143,37 +159,25 @@
       return j.translated;
     }
 
-    async function initSTTandTTS(base) {
+    async function initSTT(base) {
       const { region, token } = await getSpeechToken(base);
       const sdk = window.SpeechSDK;
+      const speechConfig = sdk.SpeechConfig.fromAuthorizationToken(token, region);
+      speechConfig.speechRecognitionLanguage = ($("fromLang") && $("fromLang").value) || "en-US";
 
-      // --- ASR ---
-      const asrConfig = sdk.SpeechConfig.fromAuthorizationToken(token, region);
-      asrConfig.speechRecognitionLanguage = $("fromLang").value || "en-US";
-      const mic = sdk.AudioConfig.fromDefaultMicrophoneInput();
-      recognizer = new sdk.SpeechRecognizer(asrConfig, mic);
+      const audioConfig = sdk.AudioConfig.fromDefaultMicrophoneInput();
+      recognizer = new sdk.SpeechRecognizer(speechConfig, audioConfig);
 
       recognizer.recognized = async (s, e) => {
         if (e.result.reason === sdk.ResultReason.RecognizedSpeech) {
           const raw = e.result.text;
-          appendCaption("localCaption", `(me): ${raw}`);
+          appendCaption("localCaption", raw);
           try {
             const translated = await translate($("backend").value.trim(), raw);
             const room = $("room").value.trim() || "room-1234";
-            socket.emit("signal", {
-              room,
-              type: "caption",
-              payload: {
-                text: translated,
-                fromUserId: USER_ID,
-                fromDeviceId: DEVICE_ID,
-                fromName: NAME
-              }
-            });
-            // Optional: speak my own translation if toggled
-            if ($("speakMine").checked && ttsSynth) {
-              ttsSynth.speakTextAsync(translated, ()=>{}, console.error);
-            }
+            // include identity metadata; server just relays
+            const NAME = resolveName();
+            socket.emit("signal", { room, type: "caption", payload: { text: translated, fromUserId: USER_ID, fromDeviceId: DEVICE_ID, fromName: NAME } });
           } catch (err) {
             console.error("translate error", err);
           }
@@ -183,38 +187,6 @@
       recognizer.canceled = (s, e) => console.warn("Speech canceled", e);
       recognizer.sessionStopped = (s, e) => console.warn("Speech session stopped", e);
       recognizer.startContinuousRecognitionAsync();
-
-      // --- TTS ---
-      const ttsConfig = sdk.SpeechConfig.fromAuthorizationToken(token, region);
-      // Default voice by target language (optional mapping)
-      const voiceByLang = {
-        en: "en-US-JennyNeural",
-        es: "es-ES-ElviraNeural",
-        fr: "fr-FR-DeniseNeural",
-        ar: "ar-EG-SalmaNeural",
-        ru: "ru-RU-DariyaNeural",
-      };
-      const tl = $("toLang").value || "en";
-      if (voiceByLang[tl]) ttsConfig.speechSynthesisVoiceName = voiceByLang[tl];
-      const speakers = sdk.AudioConfig.fromDefaultSpeakerOutput();
-      ttsSynth = new sdk.SpeechSynthesizer(ttsConfig, speakers);
-
-      // Update TTS voice when toLang changes
-      $("toLang").addEventListener("change", () => {
-        const newLang = $("toLang").value || "en";
-        const voice = voiceByLang[newLang];
-        if (voice) {
-          ttsSynth.properties.set(
-            sdk.PropertyId.SpeechServiceConnection_SynthVoice,
-            voice
-          );
-        } else {
-          ttsSynth.properties.set(
-            sdk.PropertyId.SpeechServiceConnection_SynthLanguage,
-            newLang
-          );
-        }
-      });
     }
 
     async function startMedia() {
@@ -226,18 +198,28 @@
       socket = io(base, { transports: ["websocket","polling"], path: "/socket.io", withCredentials: false });
 
       socket.on("connect", () => {
+        const NAME = resolveName();
         socket.emit("join", { room, userId: USER_ID, deviceId: DEVICE_ID, name: NAME });
         presence.set("Connected. Joining room…");
       });
 
-      // System pings
+      // Server-side errors (unique name enforcement, room_full, etc.)
       socket.on("system", (p) => {
+        if (p?.level === "error" && p?.message === "name_taken") {
+          presence.set(`Name "${p.name}" is already in use in this room. Choose another.`);
+          if ($("username")) { $("username").focus(); $("username").select(); }
+          socket.disconnect();
+          return;
+        }
+        if (p?.level === "error" && p?.message === "room_full") {
+          presence.set("Room is full. Try another room.");
+          socket.disconnect();
+          return;
+        }
         if (p?.message === "joined") presence.set("Joined room. Waiting for peer…");
         if (p?.message === "left")   presence.set("You left the room.");
-        if (p?.level === "error" && p?.message === "room_full") presence.set("Room is full. Try another room.");
       });
 
-      // Presence events (server presence layer)
       socket.on("user_joined", (p) => {
         presence.set(p.anotherDevice ? `${p.name} connected on another device.` : `${p.name} joined.`);
       });
@@ -246,15 +228,14 @@
       });
       socket.on("roster", (p) => {
         presence.roster(p.users || []);
+        updateRoomHeader(room, p.users || []);
         const n = (p.users || []).length;
-        const dbg = document.getElementById("debug");
+        const dbg = $("debug");
         if (dbg) dbg.textContent = `room=${room} | me=${USER_ID} dev=${DEVICE_ID} | players=${n}`;
         if (n === 1)       presence.set("Waiting for peer…");
-        else if (n === 2) { presence.set("Peer connected. Spinning up session…"); startWebRTCIfNeeded(room); }
-        else if (n > 2)    presence.set("Room is full. Please try another room.");
+        else if (n === 2) { presence.set("Peer connected. Starting session…"); startWebRTCIfNeeded(room); }
       });
 
-      // Signaling
       socket.on("signal", async (msg) => {
         if (msg.type === "sdp") {
           const desc = new RTCSessionDescription(msg.payload);
@@ -271,14 +252,8 @@
           const isMe = p.fromUserId && p.fromUserId === USER_ID;
           const label = isMe ? "(me)" : (p.fromName || "(peer)");
           const line  = `${label}: ${p.text}`;
-          if (isMe) {
-            appendCaption("localCaption", line);
-          } else {
-            appendCaption("remoteCaption", line);
-            if ($("speakPeer").checked && ttsSynth) {
-              ttsSynth.speakTextAsync(p.text, ()=>{}, console.error);
-            }
-          }
+          if (isMe) appendCaption("localCaption", line);
+          else appendCaption("remoteCaption", line);
         }
       });
     }
@@ -295,31 +270,17 @@
       socket.emit("signal", { room, type: "sdp", payload: pc.localDescription });
     }
 
-    $("swap").onclick = () => {
-      const fl = $("fromLang"), tl = $("toLang");
-      const isEnToEs = fl.value.startsWith("en") && tl.value === "es";
-      if (isEnToEs) { fl.value = "es-ES"; tl.value = "en"; }
-      else { fl.value = "en-US"; tl.value = "es"; }
-    };
-
     $("join").onclick = async () => {
       const base = $("backend").value.trim();
       if (!base) return alert("Enter backend URL");
       const roomFromInput = $("room").value.trim();
       const room = roomFromInput || QS_ROOM || "room-1234";
-      const dbg = document.getElementById("debug");
+      const dbg = $("debug");
       if (dbg) dbg.textContent = `room=${room} | me=${USER_ID} dev=${DEVICE_ID}`;
+      updateRoomHeader(room, []);
       await startMedia();
       initSignaling(base, room);
-      await initSTTandTTS(base);
-      // WebRTC will auto-start when the second user appears (via roster handler)
-    };
-
-    // Test helper: switch to a fresh user id in this tab
-    $("newId").onclick = () => {
-      const newUid = crypto.randomUUID();
-      localStorage.setItem("uid", newUid);
-      alert(`New identity set: ${newUid}. Reload this tab to join as a different user.`);
+      await initSTT(base);
     };
   </script>
 </body>

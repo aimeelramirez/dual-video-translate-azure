@@ -3,6 +3,9 @@ import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import socketio  # python-socketio (ASGI)
+import asyncio
+from collections import defaultdict
+from asgiref.wsgi import WsgiToAsgi
 
 # ------------------
 # Config from ENV (+ Docker fallbacks)
@@ -92,18 +95,15 @@ def speech_token():
         return jsonify({"error": "speech_token_failed"}), status
 
 # ------------------
-# Socket.IO (ASGI) + Presence for dual rooms
+# Socket.IO (ASGI) + Presence with unique names per room
 # ------------------
-import asyncio
-from collections import defaultdict
-
 sio = socketio.AsyncServer(
     async_mode="asgi",
     cors_allowed_origins=CORS_ALLOW_ORIGIN,
 )
 
 presence_lock = asyncio.Lock()
-# room -> userId -> {"name": str, "devices": set(deviceId, ...)}
+# room -> userId -> {"name": str, "devices": set(deviceId, ...)} 
 room_users = defaultdict(dict)
 
 async def emit_roster(room: str):
@@ -114,6 +114,15 @@ async def emit_roster(room: str):
             for uid, info in users.items()
         ]
     await sio.emit("roster", {"room": room, "users": roster}, room=room)
+
+def _name_taken_locked(room: str, desired_name: str, requester_user_id: str) -> bool:
+    desired = (desired_name or "").casefold()
+    for uid, info in room_users.get(room, {}).items():
+        if uid == requester_user_id:
+            continue
+        if (info.get("name") or "").casefold() == desired:
+            return True
+    return False
 
 @sio.event
 async def connect(sid, environ):
@@ -131,18 +140,21 @@ async def on_join(sid, data):
     device_id = (data.get("deviceId") or "").strip()
     name = (data.get("name") or user_id or "Guest").strip()
 
-    # Back-compat: allow room-only join (older clients)
     if not user_id or not device_id:
         sio.enter_room(sid, room)
         await sio.emit("system", {"message": "joined"}, room=room, skip_sid=sid)
         return
 
-    # Optional: capacity guard (2 distinct users max)
+    # Uniqueness & capacity check
     async with presence_lock:
-        distinct = len(room_users.get(room, {}))
-        if distinct >= 2 and user_id not in room_users[room]:
-            await sio.emit("system", {"level": "error", "message": "room_full"}, to=sid)
+        if _name_taken_locked(room, name, user_id):
+            await sio.emit("system", {"level": "error", "message": "name_taken", "name": name}, to=sid)
             return
+        # Optional capacity guard: 2 distinct users
+        # distinct = len(room_users.get(room, {}))
+        # if distinct >= 2 and user_id not in room_users[room]:
+        #     await sio.emit("system", {"level": "error", "message": "room_full"}, to=sid)
+        #     return
 
     sio.enter_room(sid, room)
     await sio.save_session(sid, {"room": room, "userId": user_id, "deviceId": device_id, "name": name})
@@ -159,9 +171,36 @@ async def on_join(sid, data):
     await sio.emit(
         "user_joined",
         {"room": room, "userId": user_id, "name": name, "deviceId": device_id, "anotherDevice": another_device},
-        room=room,
-        skip_sid=sid,
+        room=room, skip_sid=sid,
     )
+    await emit_roster(room)
+
+@sio.on("set_name")
+async def on_set_name(sid, data):
+    data = data or {}
+    new_name = (data.get("name") or "").strip()
+    if not new_name:
+        await sio.emit("system", {"level": "error", "message": "invalid_name"}, to=sid)
+        return
+    try:
+        session = await sio.get_session(sid)
+    except KeyError:
+        session = None
+    if not session:
+        return
+    room = session.get("room")
+    user_id = session.get("userId")
+
+    async with presence_lock:
+        if _name_taken_locked(room, new_name, user_id):
+            await sio.emit("system", {"level": "error", "message": "name_taken", "name": new_name}, to=sid)
+            return
+        ue = room_users.get(room, {}).get(user_id)
+        if ue:
+            ue["name"] = new_name
+
+    # update session + broadcast roster
+    await sio.save_session(sid, {**session, "name": new_name})
     await emit_roster(room)
 
 @sio.on("leave")
@@ -170,7 +209,6 @@ async def on_leave(sid, data):
 
 @sio.on("signal")
 async def on_signal(sid, data):
-    # Relay signaling/captions to everyone else in the room
     room = (data or {}).get("room") or "default"
     await sio.emit("signal", data, room=room, skip_sid=sid)
 
@@ -203,13 +241,11 @@ async def _presence_remove(sid, reason: str):
         await sio.emit(
             "user_left",
             {"room": room, "userId": user_id, "name": name, "deviceId": device_id, "lastDevice": last_device, "reason": reason},
-            room=room,
-            skip_sid=sid,
+            room=room, skip_sid=sid,
         )
         await emit_roster(room)
 
-# Wrap Flask WSGI app into ASGI and mount under Socket.IO ASGI app
-from asgiref.wsgi import WsgiToAsgi
+# Mount Flask into ASGI app
 asgi_flask = WsgiToAsgi(flask_app)
 asgi_app = socketio.ASGIApp(sio, other_asgi_app=asgi_flask)
 
