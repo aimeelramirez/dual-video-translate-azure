@@ -33,6 +33,41 @@ def health():
 def translate():
     data = request.get_json(force=True) or {}
     text = (data.get("text") or "").strip()
+    to_lang = request.args.get("to", "").strip()
+    from_lang = (data.get("from") or "").strip() or None
+
+    if not text or not to_lang:
+        return jsonify({"error": "missing_text_or_to"}), 400
+
+    params = {"api-version": "3.0", "to": to_lang}
+    if from_lang:
+        params["from"] = from_lang
+
+    headers = {
+        "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
+        "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,
+        "Content-Type": "application/json",
+    }
+    body = [{"Text": text}]
+
+    try:
+        r = requests.post(f"{API_BASE}/translate", params=params, headers=headers, json=body, timeout=10)
+        r.raise_for_status()
+        result = r.json()
+        translated = result[0]["translations"][0]["text"]
+        # ✅ This is the key line — send the translated string back
+        return jsonify({"translated": translated})
+    except requests.RequestException as e:
+        status = getattr(getattr(e, "response", None), "status_code", 500)
+        detail = None
+        try:
+            detail = e.response.json()
+        except Exception:
+            detail = str(e)
+        return jsonify({"error": "translate_failed", "detail": detail}), status
+
+    data = request.get_json(force=True) or {}
+    text = (data.get("text") or "").strip()
     from_lang = (data.get("from") or "").strip() or None
     to = request.args.get("to", "").strip()
 
