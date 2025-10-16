@@ -5,11 +5,11 @@ from flask_cors import CORS
 import socketio  # python-socketio (ASGI)
 
 # ------------------
-# Config from ENV
+# Config from ENV (+ fallbacks for your Docker)
 # ------------------
-TRANSLATOR_KEY = os.getenv("TRANSLATOR_KEY", "")
+TRANSLATOR_KEY = os.getenv("TRANSLATOR_KEY") or os.getenv("apikey", "")
 TRANSLATOR_REGION = os.getenv("TRANSLATOR_REGION", "eastus")
-TRANSLATOR_ENDPOINT = os.getenv("TRANSLATOR_ENDPOINT", "")
+TRANSLATOR_ENDPOINT = os.getenv("TRANSLATOR_ENDPOINT") or os.getenv("billing", "")
 SPEECH_KEY = os.getenv("SPEECH_KEY", "")
 SPEECH_REGION = os.getenv("SPEECH_REGION", "eastus")
 CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN", "*")
@@ -17,7 +17,7 @@ CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN", "*")
 if not TRANSLATOR_ENDPOINT:
     raise RuntimeError("TRANSLATOR_ENDPOINT is required (e.g., https://<name>.cognitiveservices.azure.com)")
 
-API_BASE = f"{TRANSLATOR_ENDPOINT}/translator/text/v3.0"
+API_BASE = f"{TRANSLATOR_ENDPOINT.rstrip('/')}/translator/text/v3.0"
 
 # ------------------
 # Flask app (WSGI)
@@ -31,50 +31,24 @@ def health():
 
 @flask_app.post("/translate")
 def translate():
-    data = request.get_json(force=True) or {}
-    text = (data.get("text") or "").strip()
-    to_lang = request.args.get("to", "").strip()
-    from_lang = (data.get("from") or "").strip() or None
-
-    if not text or not to_lang:
-        return jsonify({"error": "missing_text_or_to"}), 400
-
-    params = {"api-version": "3.0", "to": to_lang}
-    if from_lang:
-        params["from"] = from_lang
-
-    headers = {
-        "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
-        "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,
-        "Content-Type": "application/json",
-    }
-    body = [{"Text": text}]
-
-    try:
-        r = requests.post(f"{API_BASE}/translate", params=params, headers=headers, json=body, timeout=10)
-        r.raise_for_status()
-        result = r.json()
-        translated = result[0]["translations"][0]["text"]
-        # ✅ This is the key line — send the translated string back
-        return jsonify({"translated": translated})
-    except requests.RequestException as e:
-        status = getattr(getattr(e, "response", None), "status_code", 500)
-        detail = None
-        try:
-            detail = e.response.json()
-        except Exception:
-            detail = str(e)
-        return jsonify({"error": "translate_failed", "detail": detail}), status
-
-    data = request.get_json(force=True) or {}
+    data = (request.get_json(silent=True) or {})
     text = (data.get("text") or "").strip()
     from_lang = (data.get("from") or "").strip() or None
-    to = request.args.get("to", "").strip()
 
-    if not text or not to:
+    # Support single or CSV: /translate?to=en or /translate?to=en,fr,es
+    to_param = (request.args.get("to") or "").strip()
+    if not text or not to_param:
         return jsonify({"error": "missing_text_or_to"}), 400
 
-    params = {"api-version": "3.0", "to": to}
+    to_list = [t.strip() for t in to_param.split(",") if t.strip()]
+    if not to_list:
+        return jsonify({"error": "invalid_to"}), 400
+
+    params = {"api-version": "3.0"}
+    for t in to_list:
+        # 'to' is repeated per target language
+        params.setdefault("to", [])
+        params["to"].append(t)
     if from_lang:
         params["from"] = from_lang
 
@@ -89,8 +63,13 @@ def translate():
         r = requests.post(f"{API_BASE}/translate", params=params, headers=headers, json=body, timeout=10)
         r.raise_for_status()
         payload = r.json()
-        translated = payload[0]["translations"][0]["text"]
-        return jsonify({"translated": translated})
+        # Convenience: first translation text if present
+        translated = None
+        if payload and isinstance(payload, list):
+            translations = (payload[0] or {}).get("translations") or []
+            if translations:
+                translated = translations[0].get("text")
+        return jsonify({"translated": translated, "raw": payload})
     except requests.RequestException as e:
         status = getattr(getattr(e, "response", None), "status_code", 500)
         detail = None
@@ -99,8 +78,6 @@ def translate():
         except Exception:
             detail = str(e)
         return jsonify({"error": "translate_failed", "detail": detail}), status
-
-
 
 @flask_app.get("/speech/token")
 def speech_token():
@@ -118,7 +95,7 @@ def speech_token():
         return jsonify({"error": "speech_token_failed"}), status
 
 # ------------------
-# Socket.IO (ASGI server)
+# Socket.IO (ASGI server) — baseline
 # ------------------
 sio = socketio.AsyncServer(
     async_mode="asgi",
@@ -127,16 +104,18 @@ sio = socketio.AsyncServer(
 
 @sio.event
 async def connect(sid, environ):
-    pass
+    # No-op; hook for auth if needed
+    return
 
 @sio.event
 async def disconnect(sid):
-    pass
+    # No-op; add presence cleanup if you enable presence
+    return
 
 @sio.on("join")
 async def on_join(sid, data):
     room = (data or {}).get("room") or "default"
-    sio.enter_room(sid, room)
+    sio.enter_room(sid, room)  # ok to call without await in ASGI server
     await sio.emit("system", {"message": "joined"}, room=room, skip_sid=sid)
 
 @sio.on("leave")
@@ -158,4 +137,5 @@ asgi_app = socketio.ASGIApp(sio, other_asgi_app=asgi_flask)
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
+    # If this file is named app.py, "app:asgi_app" is correct.
     uvicorn.run("app:asgi_app", host="0.0.0.0", port=port, log_level="info")
