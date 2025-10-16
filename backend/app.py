@@ -1,8 +1,8 @@
 import os
 import requests
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-from flask_socketio import SocketIO, emit, join_room, leave_room
+import socketio  # python-socketio (ASGI)
 
 # ------------------
 # Config from ENV
@@ -15,34 +15,22 @@ SPEECH_REGION = os.getenv("SPEECH_REGION", "eastus")
 CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN", "*")
 
 if not TRANSLATOR_ENDPOINT:
-    # e.g., "https://<resource-name>.cognitiveservices.azure.com"
     raise RuntimeError("TRANSLATOR_ENDPOINT is required (e.g., https://<name>.cognitiveservices.azure.com)")
 
 API_BASE = f"{TRANSLATOR_ENDPOINT}/translator/text/v3.0"
 
 # ------------------
-# App setup
+# Flask app (WSGI)
 # ------------------
-app = Flask(__name__, static_folder=None)
-CORS(app, resources={r"/*": {"origins": CORS_ALLOW_ORIGIN}})
+flask_app = Flask(__name__)
+CORS(flask_app, resources={r"/*": {"origins": CORS_ALLOW_ORIGIN}})
 
-# Use eventlet-based server for WebSocket support on many hosts
-socketio = SocketIO(app, cors_allowed_origins=CORS_ALLOW_ORIGIN)
-
-# ------------------
-# Routes
-# ------------------
-
-@app.get("/health")
+@flask_app.get("/health")
 def health():
     return {"ok": True}
 
-@app.post("/translate")
+@flask_app.post("/translate")
 def translate():
-    """
-    Body: { "text": "...", "to": "fr", "from": "en" (optional) }
-    Proxies to Azure Translator with key + region headers.
-    """
     data = request.get_json(force=True) or {}
     text = (data.get("text") or "").strip()
     to = (data.get("to") or "").strip()
@@ -77,16 +65,10 @@ def translate():
             detail = str(e)
         return jsonify({"error": "translate_failed", "detail": detail}), status
 
-@app.get("/speech/token")
+@flask_app.get("/speech/token")
 def speech_token():
-    """
-    Issues a short-lived Azure Speech token using the standard STS endpoint.
-    Do not expose SPEECH_KEY to the browser.
-    """
     if not SPEECH_KEY:
         return jsonify({"error": "missing_speech_key"}), 500
-
-    # Official token issuance endpoint
     url = f"https://{SPEECH_REGION}.api.cognitive.microsoft.com/sts/v1.0/issueToken"
     headers = {"Ocp-Apim-Subscription-Key": SPEECH_KEY}
     try:
@@ -99,31 +81,44 @@ def speech_token():
         return jsonify({"error": "speech_token_failed"}), status
 
 # ------------------
-# Socket.IO signaling for WebRTC + captions
+# Socket.IO (ASGI server)
 # ------------------
+sio = socketio.AsyncServer(
+    async_mode="asgi",
+    cors_allowed_origins=CORS_ALLOW_ORIGIN,
+)
 
-@socketio.on("join")
-def on_join(data):
+@sio.event
+async def connect(sid, environ):
+    pass
+
+@sio.event
+async def disconnect(sid):
+    pass
+
+@sio.on("join")
+async def on_join(sid, data):
     room = (data or {}).get("room") or "default"
-    join_room(room)
-    emit("system", {"message": "joined"}, to=room)
+    sio.enter_room(sid, room)
+    await sio.emit("system", {"message": "joined"}, room=room, skip_sid=sid)
 
-@socketio.on("signal")
-def on_signal(data):
-    # Pass-through signaling messages to all peers except sender
+@sio.on("leave")
+async def on_leave(sid, data):
     room = (data or {}).get("room") or "default"
-    emit("signal", data, to=room, include_self=False)
+    sio.leave_room(sid, room)
+    await sio.emit("system", {"message": "left"}, room=room, skip_sid=sid)
 
-@socketio.on("leave")
-def on_leave(data):
+@sio.on("signal")
+async def on_signal(sid, data):
     room = (data or {}).get("room") or "default"
-    leave_room(room)
-    emit("system", {"message": "left"}, to=room)
+    await sio.emit("signal", data, room=room, skip_sid=sid)
 
-# ------------------
-# Main
-# ------------------
+# Wrap Flask WSGI app into ASGI and mount under Socket.IO ASGI app
+from asgiref.wsgi import WsgiToAsgi
+asgi_flask = WsgiToAsgi(flask_app)
+asgi_app = socketio.ASGIApp(sio, other_asgi_app=asgi_flask)
+
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.getenv("PORT", "8000"))
-    # eventlet is auto-used by SocketIO when installed
-    socketio.run(app, host="0.0.0.0", port=port)
+    uvicorn.run("app:asgi_app", host="0.0.0.0", port=port, log_level="info")
