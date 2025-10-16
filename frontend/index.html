@@ -1,3 +1,6 @@
+# Fixed Frontend (index.html)
+
+
 <!doctype html>
 <html>
 <head>
@@ -17,15 +20,14 @@
 
   <!-- Azure Speech SDK -->
   <script src="https://aka.ms/csspeech/jsbrowserpackageraw"></script>
-  <!-- Socket.IO -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.8.1/socket.io.min.js"></script>
-<script src="https://cdn.socket.io/4.8.1/socket.io.min.js" integrity="sha384-mkQ3/7FUtcGyoppY6bz/PORYoGqOl7/aSUMn2ymDOJcapfS6PHqxhRTMh1RR0Q6+" crossorigin="anonymous"></script>
-<script src="vendor/socket.io.min.js" integrity="sha384-2huaZvOR9iDzHqslqwpR87isEmrfxqyWOF7hr7BY6KG0+hVKLoEXMPUJw3ynWuhO" crossorigin="anonymous"></script>
-    </script>
-  
+  <!-- Socket.IO (load exactly once) -->
+  <script src="https://cdn.socket.io/4.8.1/socket.io.min.js" crossorigin="anonymous"></script>
 </head>
 <body>
   <h2>Two-Way Video with Live STT + Translation</h2>
+  <div id="presence" style="margin:.5rem 0; font:14px system-ui;"></div>
+  <ul id="roster" style="margin:.25rem 0; padding-left:1rem;"></ul>
+
   <div class="row">
     <input id="backend" size="48"
            placeholder="https://dual-video-translate-azure.onrender.com"
@@ -70,6 +72,27 @@
     const $ = (id) => document.getElementById(id);
     let pc, socket, localStream, recognizer;
 
+    // --- Presence helpers ---
+    const presence = {
+      set: (msg) => { const el = $("presence"); if (el) el.textContent = msg; },
+      roster: (users=[]) => {
+        const list = $("roster"); if (!list) return;
+        list.innerHTML = "";
+        users.forEach(u => {
+          const li = document.createElement("li");
+          li.textContent = `${u.name || u.userId} (${u.devices.length} device${u.devices.length>1?"s":""})`;
+          list.appendChild(li);
+        });
+      }
+    };
+
+    // Stable identity per browser; fresh device per tab/session
+    const USER_ID   = localStorage.getItem("uid")     || crypto.randomUUID();
+    const NAME      = localStorage.getItem("displayName") || "Guest";
+    const DEVICE_ID = sessionStorage.getItem("deviceId")  || crypto.randomUUID();
+    localStorage.setItem("uid", USER_ID);
+    sessionStorage.setItem("deviceId", DEVICE_ID);
+
     // Utility to map locale → Azure Translator language code
     function shortCode(locale) {
       if (!locale) return "";
@@ -93,7 +116,6 @@
     async function translate(base, text) {
       const toLang = $("toLang").value;
       const fromLocale = $("fromLang").value;
-      console.log(toLang)
       const from = shortCode(fromLocale);
       const r = await fetch(`${base}/translate?to=${encodeURIComponent(toLang)}`, {
         method: "POST",
@@ -101,9 +123,6 @@
         body: JSON.stringify({ text, from })
       });
       const j = await r.json();
-      console.log(j)
-      document.getElementById("remoteCaption").innerHTML = '<li>'+
-      `${j.translated}`+'</li>'
       if (!r.ok) throw new Error(j.error || "translate_failed");
       return j.translated;
     }
@@ -122,7 +141,7 @@
           const raw = e.result.text;
           appendCaption("localCaption", raw);
           try {
-            const translated = await translate(base, raw);
+            const translated = await translate($("backend").value.trim(), raw);
             const room = $("room").value.trim() || "room-1234";
             socket.emit("signal", { room, type: "caption", payload: { text: translated } });
           } catch (err) {
@@ -142,8 +161,36 @@
     }
 
     function initSignaling(base, room) {
-      socket = io(base, { transports: ["polling", "websocket"], path: "/socket.io", withCredentials: false });
-      socket.on("connect", () => socket.emit("join", { room }));
+      socket = io(base, { transports: ["websocket","polling"], path: "/socket.io", withCredentials: false });
+
+      socket.on("connect", () => {
+        socket.emit("join", { room, userId: USER_ID, deviceId: DEVICE_ID, name: NAME });
+        presence.set("Connected. Joining room…");
+      });
+
+      // System pings
+      socket.on("system", (p) => {
+        if (p?.message === "joined") presence.set("Joined room. Waiting for peer…");
+        if (p?.message === "left")   presence.set("You left the room.");
+        if (p?.level === "error" && p?.message === "room_full") presence.set("Room is full. Try another room.");
+      });
+
+      // Presence events (server presence layer)
+      socket.on("user_joined", (p) => {
+        presence.set(p.anotherDevice ? `${p.name} connected on another device.` : `${p.name} joined.`);
+      });
+      socket.on("user_left", (p) => {
+        presence.set(p.lastDevice ? `${p.name} disconnected (last device).` : `${p.name} closed one device.`);
+      });
+      socket.on("roster", (p) => {
+        presence.roster(p.users || []);
+        const n = (p.users || []).length;
+        if (n === 1)       presence.set("Waiting for peer…");
+        else if (n === 2) { presence.set("Peer connected. Spinning up session…"); startWebRTCIfNeeded(room); }
+        else if (n > 2)    presence.set("Room is full. Please try another room.");
+      });
+
+      // Signaling
       socket.on("signal", async (msg) => {
         if (msg.type === "sdp") {
           const desc = new RTCSessionDescription(msg.payload);
@@ -161,14 +208,13 @@
       });
     }
 
-    async function initWebRTC(room) {
+    let webrtcStarted = false;
+    async function startWebRTCIfNeeded(room) {
+      if (webrtcStarted) return; webrtcStarted = true;
       pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
       localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
       pc.ontrack = (e) => { $("remoteVideo").srcObject = e.streams[0]; };
-      pc.onicecandidate = ({ candidate }) => {
-        if (candidate) socket.emit("signal", { room, type: "ice", payload: candidate });
-      };
-
+      pc.onicecandidate = ({ candidate }) => { if (candidate) socket.emit("signal", { room, type: "ice", payload: candidate }); };
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       socket.emit("signal", { room, type: "sdp", payload: pc.localDescription });
@@ -185,12 +231,13 @@
       const base = $("backend").value.trim();
       if (!base) return alert("Enter backend URL");
       const room = $("room").value.trim() || "room-1234";
-
       await startMedia();
       initSignaling(base, room);
-      await initWebRTC(room);
       await initSTT(base);
+      // WebRTC will auto-start when the second user appears (via roster handler)
     };
   </script>
 </body>
 </html>
+
+---

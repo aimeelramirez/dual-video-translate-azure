@@ -1,3 +1,8 @@
+
+
+# Fixed Backend (app.py)
+
+
 import os
 import requests
 from flask import Flask, request, jsonify
@@ -5,7 +10,7 @@ from flask_cors import CORS
 import socketio  # python-socketio (ASGI)
 
 # ------------------
-# Config from ENV (+ fallbacks for your Docker)
+# Config from ENV (+ fallbacks for Docker vars)
 # ------------------
 TRANSLATOR_KEY = os.getenv("TRANSLATOR_KEY") or os.getenv("apikey", "")
 TRANSLATOR_REGION = os.getenv("TRANSLATOR_REGION", "eastus")
@@ -35,7 +40,6 @@ def translate():
     text = (data.get("text") or "").strip()
     from_lang = (data.get("from") or "").strip() or None
 
-    # Support single or CSV: /translate?to=en or /translate?to=en,fr,es
     to_param = (request.args.get("to") or "").strip()
     if not text or not to_param:
         return jsonify({"error": "missing_text_or_to"}), 400
@@ -46,7 +50,6 @@ def translate():
 
     params = {"api-version": "3.0"}
     for t in to_list:
-        # 'to' is repeated per target language
         params.setdefault("to", [])
         params["to"].append(t)
     if from_lang:
@@ -63,7 +66,6 @@ def translate():
         r = requests.post(f"{API_BASE}/translate", params=params, headers=headers, json=body, timeout=10)
         r.raise_for_status()
         payload = r.json()
-        # Convenience: first translation text if present
         translated = None
         if payload and isinstance(payload, list):
             translations = (payload[0] or {}).get("translations") or []
@@ -95,39 +97,120 @@ def speech_token():
         return jsonify({"error": "speech_token_failed"}), status
 
 # ------------------
-# Socket.IO (ASGI server) — baseline
+# Socket.IO (ASGI) + Presence for dual rooms
 # ------------------
+import asyncio
+from collections import defaultdict
+
 sio = socketio.AsyncServer(
     async_mode="asgi",
     cors_allowed_origins=CORS_ALLOW_ORIGIN,
 )
 
+presence_lock = asyncio.Lock()
+# room -> userId -> {"name": str, "devices": set(deviceId, ...)}
+room_users = defaultdict(dict)
+
+async def emit_roster(room: str):
+    async with presence_lock:
+        users = room_users.get(room, {})
+        roster = [
+            {"userId": uid, "name": info.get("name") or uid, "devices": sorted(list(info.get("devices", set())))}
+            for uid, info in users.items()
+        ]
+    await sio.emit("roster", {"room": room, "users": roster}, room=room)
+
 @sio.event
 async def connect(sid, environ):
-    # No-op; hook for auth if needed
     return
 
 @sio.event
 async def disconnect(sid):
-    # No-op; add presence cleanup if you enable presence
-    return
+    await _presence_remove(sid, "disconnect")
 
 @sio.on("join")
 async def on_join(sid, data):
-    room = (data or {}).get("room") or "default"
-    sio.enter_room(sid, room)  # ok to call without await in ASGI server
-    await sio.emit("system", {"message": "joined"}, room=room, skip_sid=sid)
+    data = data or {}
+    room = (data.get("room") or "default").strip() or "default"
+    user_id = (data.get("userId") or "").strip()
+    device_id = (data.get("deviceId") or "").strip()
+    name = (data.get("name") or user_id or "Guest").strip()
+
+    # Back-compat: allow room-only join
+    if not user_id or not device_id:
+        sio.enter_room(sid, room)
+        await sio.emit("system", {"message": "joined"}, room=room, skip_sid=sid)
+        return
+
+    # Optional capacity guard (max 2 distinct users)
+    async with presence_lock:
+        distinct = len(room_users.get(room, {}))
+        if distinct >= 2 and user_id not in room_users[room]:
+            await sio.emit("system", {"level": "error", "message": "room_full"}, to=sid)
+            return
+
+    sio.enter_room(sid, room)
+    await sio.save_session(sid, {"room": room, "userId": user_id, "deviceId": device_id, "name": name})
+
+    async with presence_lock:
+        already = user_id in room_users[room]
+        if not already:
+            room_users[room][user_id] = {"name": name, "devices": set()}
+        pre = set(room_users[room][user_id]["devices"])
+        room_users[room][user_id]["devices"].add(device_id)
+
+    another_device = already and (device_id not in pre)
+
+    await sio.emit(
+        "user_joined",
+        {"room": room, "userId": user_id, "name": name, "deviceId": device_id, "anotherDevice": another_device},
+        room=room,
+        skip_sid=sid,
+    )
+    await emit_roster(room)
 
 @sio.on("leave")
 async def on_leave(sid, data):
-    room = (data or {}).get("room") or "default"
-    sio.leave_room(sid, room)
-    await sio.emit("system", {"message": "left"}, room=room, skip_sid=sid)
+    await _presence_remove(sid, "leave")
 
 @sio.on("signal")
 async def on_signal(sid, data):
     room = (data or {}).get("room") or "default"
     await sio.emit("signal", data, room=room, skip_sid=sid)
+
+async def _presence_remove(sid, reason: str):
+    try:
+        session = await sio.get_session(sid)
+    except KeyError:
+        session = None
+    if not session:
+        return
+
+    room = session.get("room")
+    user_id = session.get("userId")
+    device_id = session.get("deviceId")
+    name = session.get("name") or user_id
+    last_device = False
+
+    async with presence_lock:
+        ue = room_users.get(room, {}).get(user_id)
+        if ue:
+            ds = ue.get("devices", set())
+            ds.discard(device_id)
+            if not ds:
+                last_device = True
+                room_users[room].pop(user_id, None)
+                if not room_users[room]:
+                    room_users.pop(room, None)
+
+    if room:
+        await sio.emit(
+            "user_left",
+            {"room": room, "userId": user_id, "name": name, "deviceId": device_id, "lastDevice": last_device, "reason": reason},
+            room=room,
+            skip_sid=sid,
+        )
+        await emit_roster(room)
 
 # Wrap Flask WSGI app into ASGI and mount under Socket.IO ASGI app
 from asgiref.wsgi import WsgiToAsgi
@@ -137,5 +220,4 @@ asgi_app = socketio.ASGIApp(sio, other_asgi_app=asgi_flask)
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
-    # If this file is named app.py, "app:asgi_app" is correct.
     uvicorn.run("app:asgi_app", host="0.0.0.0", port=port, log_level="info")
