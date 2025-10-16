@@ -18,12 +18,13 @@
 <script src="https://aka.ms/csspeech/jsbrowserpackageraw"></script>
 
 <!-- Socket.IO client (must be before your custom script) -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.8.1/socket.io.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.8.1/socket.io.js"></script>
+
 </head>
 <body>
   <h2>Two-Way Video with Live STT + Translation</h2>
   <div class="row">
-    <input id="backend" size="48" placeholder="https://your-backend.onrender.com" />
+    <input id="backend" size="48" placeholder="https://dual-video-translate-azure.onrender.com" value="https://dual-video-translate-azure.onrender.com"/>
     <input id="room" placeholder="room-1234" />
     <select id="fromLang">
       <option value="">Auto (Speech SDK auto-detect disabled here; using explicit locale)</option>
@@ -59,7 +60,14 @@
   <!-- Azure Speech SDK -->
   <script src="https://aka.ms/csspeech/jsbrowserpackageraw"></script>
   <!-- Socket.IO -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.8.1/socket.io.min.js"></script>
+       <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.8.1/socket.io.min.js"></script>
+<script src="https://cdn.socket.io/4.8.1/socket.io.min.js" integrity="sha384-mkQ3/7FUtcGyoppY6bz/PORYoGqOl7/aSUMn2ymDOJcapfS6PHqxhRTMh1RR0Q6+" crossorigin="anonymous"></script>
+
+
+
+    <script src="vendor/socket.io.min.js" integrity="sha384-2huaZvOR9iDzHqslqwpR87isEmrfxqyWOF7hr7BY6KG0+hVKLoEXMPUJw3ynWuhO" crossorigin="anonymous"></script>
+    </script>
+  
   <script>
     const $ = (id) => document.getElementById(id);
     let pc, socket, localStream, recognizer;
@@ -72,13 +80,22 @@
     }
 
     async function getSpeechToken(base) {
-      const r = await fetch(base + "/speech/token");
-      if (!r.ok) throw new Error("Failed to get speech token");
-      return r.json(); // { region, token }
+      const response = await fetch("https://dual-video-translate-azure.onrender.com"+ "/speech/token");
+      try {
+    if (!response.ok) {
+      throw new Error(`Response status: ${response.status}`);
+    }
+
+    const result = await response.json();
+    console.log(result);
+    return result
+  } catch (error) {
+    console.error(error.message);
+  }
     }
 
     async function translate(base, text, to, from) {
-      const r = await fetch(base + "/translate", {
+      const r = await fetch("https://dual-video-translate-azure.onrender.com" + "/translate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text, to, from })
