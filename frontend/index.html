@@ -102,7 +102,7 @@
       });
       const j = await r.json();
       console.log(j)
-      document.getElementById("remoteCaption").innerHTML += '<li>'+
+      document.getElementById("remoteCaption").innerHTML = '<li>'+
       `${j.translated}`+'</li>'
       if (!r.ok) throw new Error(j.error || "translate_failed");
       return j.translated;
