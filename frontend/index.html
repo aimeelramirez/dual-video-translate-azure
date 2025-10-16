@@ -250,7 +250,7 @@
         } else if (msg.type === "caption") {
           const p = msg.payload || {};
           const isMe = p.fromUserId && p.fromUserId === USER_ID;
-          const label = isMe && p?.fromName ? p.fromName : (p.fromName || "(peer)");
+          const label = isMe ? "(me)" : (p.fromName || "(peer)");
           const line  = `${label}: ${p.text}`;
           if (isMe) appendCaption("localCaption", line);
           else appendCaption("remoteCaption", line);
