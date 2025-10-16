@@ -50,7 +50,10 @@
 
     <button id="swap">Swap EN↔ES</button>
     <button id="join">Join</button>
+    <button id="newId" title="Use a new random user id in this tab">New Identity</button>
   </div>
+
+  <div id="debug" style="font:12px system-ui;opacity:.8;margin-bottom:8px"></div>
 
   <div class="grid">
     <div class="panel">
@@ -83,14 +86,20 @@
       }
     };
 
+    // Allow overriding identity via URL: ?uid=alice & ?room=demo
+    const QS = new URLSearchParams(location.search);
+    const QS_UID  = (QS.get("uid")  || "").trim();
+    const QS_ROOM = (QS.get("room") || "").trim();
+
     // Stable identity per browser; fresh device per tab/session
-    const USER_ID   = localStorage.getItem("uid")     || crypto.randomUUID();
-    const NAME      = localStorage.getItem("displayName") || "Guest";
-    const DEVICE_ID = sessionStorage.getItem("deviceId")  || crypto.randomUUID();
+    const USER_ID   = QS_UID || localStorage.getItem("uid") || crypto.randomUUID();
+    if (QS_UID) localStorage.setItem("uid", USER_ID);
+    const NAME      = localStorage.getItem("displayName") || USER_ID || "Guest";
+    const DEVICE_ID = sessionStorage.getItem("deviceId")   || crypto.randomUUID();
     localStorage.setItem("uid", USER_ID);
     sessionStorage.setItem("deviceId", DEVICE_ID);
 
-    // Utility to map locale → Azure Translator language code
+    // Locale → short code (e.g., en-US → en)
     function shortCode(locale) {
       if (!locale) return "";
       const dash = locale.indexOf("-");
@@ -182,6 +191,8 @@
       socket.on("roster", (p) => {
         presence.roster(p.users || []);
         const n = (p.users || []).length;
+        const dbg = document.getElementById("debug");
+        if (dbg) dbg.textContent = `room=${room} | me=${USER_ID} dev=${DEVICE_ID} | players=${n}`;
         if (n === 1)       presence.set("Waiting for peer…");
         else if (n === 2) { presence.set("Peer connected. Spinning up session…"); startWebRTCIfNeeded(room); }
         else if (n > 2)    presence.set("Room is full. Please try another room.");
@@ -227,11 +238,21 @@
     $("join").onclick = async () => {
       const base = $("backend").value.trim();
       if (!base) return alert("Enter backend URL");
-      const room = $("room").value.trim() || "room-1234";
+      const roomFromInput = $("room").value.trim();
+      const room = roomFromInput || QS_ROOM || "room-1234";
+      const dbg = document.getElementById("debug");
+      if (dbg) dbg.textContent = `room=${room} | me=${USER_ID} dev=${DEVICE_ID}`;
       await startMedia();
       initSignaling(base, room);
       await initSTT(base);
       // WebRTC will auto-start when the second user appears (via roster handler)
+    };
+
+    // Test helper: switch to a fresh user id in this tab
+    $("newId").onclick = () => {
+      const newUid = crypto.randomUUID();
+      localStorage.setItem("uid", newUid);
+      alert(`New identity set: ${newUid}. Reload this tab to join as a different user.`);
     };
   </script>
 </body>
