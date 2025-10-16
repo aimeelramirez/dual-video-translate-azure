@@ -5,7 +5,7 @@ from flask_cors import CORS
 import socketio  # python-socketio (ASGI)
 
 # ------------------
-# Config from ENV (+ fallbacks for Docker vars)
+# Config from ENV (+ Docker fallbacks)
 # ------------------
 TRANSLATOR_KEY = os.getenv("TRANSLATOR_KEY") or os.getenv("apikey", "")
 TRANSLATOR_REGION = os.getenv("TRANSLATOR_REGION", "eastus")
@@ -131,13 +131,13 @@ async def on_join(sid, data):
     device_id = (data.get("deviceId") or "").strip()
     name = (data.get("name") or user_id or "Guest").strip()
 
-    # Back-compat: allow room-only join
+    # Back-compat: allow room-only join (older clients)
     if not user_id or not device_id:
         sio.enter_room(sid, room)
         await sio.emit("system", {"message": "joined"}, room=room, skip_sid=sid)
         return
 
-    # Optional capacity guard (max 2 distinct users)
+    # Optional: capacity guard (2 distinct users max)
     async with presence_lock:
         distinct = len(room_users.get(room, {}))
         if distinct >= 2 and user_id not in room_users[room]:
@@ -170,6 +170,7 @@ async def on_leave(sid, data):
 
 @sio.on("signal")
 async def on_signal(sid, data):
+    # Relay signaling/captions to everyone else in the room
     room = (data or {}).get("room") or "default"
     await sio.emit("signal", data, room=room, skip_sid=sid)
 

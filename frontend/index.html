@@ -11,7 +11,7 @@
     video { width: 100%; border-radius: 8px; background: #000; }
     .captions { font-size: 14px; margin-top: 8px; white-space: pre-wrap; min-height: 64px; }
     .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
-    input, select, button { padding: 8px; }
+    input, select, button, label { padding: 8px; }
     h2 { margin-top: 0; }
   </style>
 
@@ -22,6 +22,7 @@
 </head>
 <body>
   <h2>Two-Way Video with Live STT + Translation</h2>
+
   <div id="presence" style="margin:.5rem 0; font:14px system-ui;"></div>
   <ul id="roster" style="margin:.25rem 0; padding-left:1rem;"></ul>
 
@@ -53,6 +54,15 @@
     <button id="newId" title="Use a new random user id in this tab">New Identity</button>
   </div>
 
+  <div class="row" style="gap:16px;">
+    <label style="display:inline-flex;align-items:center;gap:.35rem;">
+      <input type="checkbox" id="speakPeer" checked> Speak peer captions
+    </label>
+    <label style="display:inline-flex;align-items:center;gap:.35rem;">
+      <input type="checkbox" id="speakMine"> Speak my captions
+    </label>
+  </div>
+
   <div id="debug" style="font:12px system-ui;opacity:.8;margin-bottom:8px"></div>
 
   <div class="grid">
@@ -70,7 +80,7 @@
 
   <script>
     const $ = (id) => document.getElementById(id);
-    let pc, socket, localStream, recognizer;
+    let pc, socket, localStream, recognizer, ttsSynth;
 
     // --- Presence helpers ---
     const presence = {
@@ -133,23 +143,37 @@
       return j.translated;
     }
 
-    async function initSTT(base) {
+    async function initSTTandTTS(base) {
       const { region, token } = await getSpeechToken(base);
       const sdk = window.SpeechSDK;
-      const speechConfig = sdk.SpeechConfig.fromAuthorizationToken(token, region);
-      speechConfig.speechRecognitionLanguage = $("fromLang").value || "en-US";
 
-      const audioConfig = sdk.AudioConfig.fromDefaultMicrophoneInput();
-      recognizer = new sdk.SpeechRecognizer(speechConfig, audioConfig);
+      // --- ASR ---
+      const asrConfig = sdk.SpeechConfig.fromAuthorizationToken(token, region);
+      asrConfig.speechRecognitionLanguage = $("fromLang").value || "en-US";
+      const mic = sdk.AudioConfig.fromDefaultMicrophoneInput();
+      recognizer = new sdk.SpeechRecognizer(asrConfig, mic);
 
       recognizer.recognized = async (s, e) => {
         if (e.result.reason === sdk.ResultReason.RecognizedSpeech) {
           const raw = e.result.text;
-          appendCaption("localCaption", raw);
+          appendCaption("localCaption", `(me): ${raw}`);
           try {
             const translated = await translate($("backend").value.trim(), raw);
             const room = $("room").value.trim() || "room-1234";
-            socket.emit("signal", { room, type: "caption", payload: { text: translated } });
+            socket.emit("signal", {
+              room,
+              type: "caption",
+              payload: {
+                text: translated,
+                fromUserId: USER_ID,
+                fromDeviceId: DEVICE_ID,
+                fromName: NAME
+              }
+            });
+            // Optional: speak my own translation if toggled
+            if ($("speakMine").checked && ttsSynth) {
+              ttsSynth.speakTextAsync(translated, ()=>{}, console.error);
+            }
           } catch (err) {
             console.error("translate error", err);
           }
@@ -159,6 +183,38 @@
       recognizer.canceled = (s, e) => console.warn("Speech canceled", e);
       recognizer.sessionStopped = (s, e) => console.warn("Speech session stopped", e);
       recognizer.startContinuousRecognitionAsync();
+
+      // --- TTS ---
+      const ttsConfig = sdk.SpeechConfig.fromAuthorizationToken(token, region);
+      // Default voice by target language (optional mapping)
+      const voiceByLang = {
+        en: "en-US-JennyNeural",
+        es: "es-ES-ElviraNeural",
+        fr: "fr-FR-DeniseNeural",
+        ar: "ar-EG-SalmaNeural",
+        ru: "ru-RU-DariyaNeural",
+      };
+      const tl = $("toLang").value || "en";
+      if (voiceByLang[tl]) ttsConfig.speechSynthesisVoiceName = voiceByLang[tl];
+      const speakers = sdk.AudioConfig.fromDefaultSpeakerOutput();
+      ttsSynth = new sdk.SpeechSynthesizer(ttsConfig, speakers);
+
+      // Update TTS voice when toLang changes
+      $("toLang").addEventListener("change", () => {
+        const newLang = $("toLang").value || "en";
+        const voice = voiceByLang[newLang];
+        if (voice) {
+          ttsSynth.properties.set(
+            sdk.PropertyId.SpeechServiceConnection_SynthVoice,
+            voice
+          );
+        } else {
+          ttsSynth.properties.set(
+            sdk.PropertyId.SpeechServiceConnection_SynthLanguage,
+            newLang
+          );
+        }
+      });
     }
 
     async function startMedia() {
@@ -211,7 +267,18 @@
         } else if (msg.type === "ice") {
           try { await pc.addIceCandidate(msg.payload); } catch {}
         } else if (msg.type === "caption") {
-          appendCaption("remoteCaption", msg.payload.text);
+          const p = msg.payload || {};
+          const isMe = p.fromUserId && p.fromUserId === USER_ID;
+          const label = isMe ? "(me)" : (p.fromName || "(peer)");
+          const line  = `${label}: ${p.text}`;
+          if (isMe) {
+            appendCaption("localCaption", line);
+          } else {
+            appendCaption("remoteCaption", line);
+            if ($("speakPeer").checked && ttsSynth) {
+              ttsSynth.speakTextAsync(p.text, ()=>{}, console.error);
+            }
+          }
         }
       });
     }
@@ -244,7 +311,7 @@
       if (dbg) dbg.textContent = `room=${room} | me=${USER_ID} dev=${DEVICE_ID}`;
       await startMedia();
       initSignaling(base, room);
-      await initSTT(base);
+      await initSTTandTTS(base);
       // WebRTC will auto-start when the second user appears (via roster handler)
     };
 
